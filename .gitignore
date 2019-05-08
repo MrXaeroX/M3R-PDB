@@ -1,0 +1,6 @@
+# Configs with potentially sensitive data.
+config/*.yaml
+
+# Misc files.
+*.pyc
+Thumbs.db

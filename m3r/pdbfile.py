@@ -78,11 +78,10 @@ class PDBFile( object ):
 
   def __init__( self, filename=None ):
     self.atoms = {}
-    self.residues = {}
+    self.chains = {}
     self.remarks = []
     self._chain_index = 0
-    self._min_resid = 99999999
-    self._max_resid = 0
+    self._chain_custom = False
     self._filename = ""
     self._linecount = 0
     if filename:
@@ -91,6 +90,7 @@ class PDBFile( object ):
   def Load( self, filename ):
     self._filename = filename
     self._linecount = 1
+    self._chain_custom = False
     with open( filename, "r" ) as file_object:
       line = file_object.readline()
       while line:
@@ -118,14 +118,15 @@ class PDBFile( object ):
       current_chain = None
       for _, value in self.atoms.iteritems():
         line = ""
-        if current_chain != value["chain"]:
+        if current_chain != value["chain2"]:
           if current_chain:
             line += "{:6}{:5d}\n".format( "TER", current_serial )
-          current_chain = value["chain"]
+          current_chain = value["chain2"]
         current_serial = current_serial + 1
+        real_chain = value["chain"] if self._chain_custom else value["chain2"]
         line += "{:6}{:5d}".format( "ATOM", current_serial )
         line += " {:.4}{:1}".format( value["title"], value["atloc"] )
-        line += "{:.3} {:.1}{:4d}    ".format( value["residue"], current_chain,
+        line += "{:.3} {:.1}{:4d}    ".format( value["residue"], real_chain,
                                                value["resid"] )
         for j in range( 0, 3 ):
           line += "{:8.3f}".format( value["coords"][j] )
@@ -134,39 +135,46 @@ class PDBFile( object ):
         file_object.write( line )
       file_object.write( "{:6}{:5d}\nEND\n".format( "TER", current_serial ) )
 
-  def GetFASTA( self ):
+  def GetFASTA( self, chainid ):
     fasta = ""
-    for resid in range( 1, self._max_resid + 1 ):
-      if resid not in self.residues:
+    if not chainid in self.chains:
+      return fasta
+    if not "residues" in self.chains[chainid]:
+      return fasta
+    maxresid = self.chains[chainid]["max_resid"]
+    for resid in range( 1, maxresid + 1 ):
+      if resid not in self.chains[chainid]["residues"]:
         fasta += "-"
-      elif self.residues[resid] in _AA_MAP:
-        fasta += _AA_MAP[self.residues[resid]]
       else:
-        break  # End of protein.
+        curresid = self.chains[chainid]["residues"][resid]
+        if curresid in _AA_MAP:
+          fasta += _AA_MAP[curresid]
+        else:
+          # End of protein.
+          break
     return fasta
 
-  def GetResidueBaseOffset( self ):
-    return self._min_resid - 1
-
-  def ResidueExists( self, resid ):
-    return resid in self.residues
-
-  def MutateAA( self, mutation_info ):
+  def MutateAA( self, chainid, mutation_info ):
+    if not chainid in self.chains:
+      raise RuntimeError( "%s: no chain " + chainid )
+    if not "residues" in self.chains[chainid]:
+      raise RuntimeError( "%s: chain " + chainid + " with no residues" )
     resid = mutation_info["resid"]
     aafrom_1let = mutation_info["from"]
     aato_3let = _AA_MAP_INVERSE[mutation_info["to"]]
-    if not resid in self.residues:
+    residue_dict = self.chains[chainid]["residues"]
+    if not resid in residue_dict:
       raise RuntimeError( "%s: missing residue %i." % \
                          ( self._filename, resid ) )
-    if _AA_MAP[self.residues[resid]] != aafrom_1let:
+    if _AA_MAP[residue_dict[resid]] != aafrom_1let:
       raise RuntimeError( "%s: residue %s-%i is not %s." % \
-                         ( self._filename, self.residues[resid], resid,
+                         ( self._filename, residue_dict[resid], resid,
                            aafrom_1let ) )
-    self.residues[resid] = aato_3let
+    residue_dict[resid] = aato_3let
     # Remove AA atoms, except the backbone.
     stale_serials = []
     for key, value in self.atoms.iteritems():
-      if value["resid"] != resid:
+      if value["chain"] != chainid or value["resid"] != resid:
         continue
       atom_title = value["title"]
       # Remove non-backbone atoms. Also try to preserve beta-carbon, if possible.
@@ -191,18 +199,31 @@ class PDBFile( object ):
     if serial in self.atoms:
       raise RuntimeError( "%s@%i: duplicate atom %i." % \
                           ( self._filename, self._linecount, serial ) )
+    chainid = line[21:22]
+    if not chainid:
+      raise RuntimeError( "%s@%i: missing chain identifier for atom %i." % \
+                          ( self._filename, self._linecount, serial ) )
+    if chainid != "A":
+      self._chain_custom = True
     resid = int( line[22:26] )
     resname = line[17:20]
-    if resid < self._min_resid:
-      self._min_resid = resid
-    if resid > self._max_resid:
-      self._max_resid = resid
-    if resid not in self.residues:
-      self.residues[resid] = resname.strip().upper()
+    if not chainid in self.chains:
+      self.chains[chainid] = {}
+      self.chains[chainid]["min_resid"] = resid
+      self.chains[chainid]["max_resid"] = resid
+      self.chains[chainid]["residues"] = {}
+    else:
+      if resid < self.chains[chainid]["min_resid"]:
+        self.chains[chainid]["min_resid"] = resid
+      if resid > self.chains[chainid]["max_resid"]:
+        self.chains[chainid]["max_resid"] = resid
+    if resid not in self.chains[chainid]["residues"]:
+      self.chains[chainid]["residues"][resid] = resname.strip().upper()
     atom_desc["title"] = line[12:16]
     atom_desc["atloc"] = line[16]
     atom_desc["residue"] = resname
-    atom_desc["chain"] = chr( ord( "A" ) + self._chain_index )
+    atom_desc["chain"] = chainid
+    atom_desc["chain2"] = chr( ord( "A" ) + self._chain_index )
     atom_desc["resid"] = resid
     atom_desc["coords"] = [ float( line[30:38] ),
                             float( line[38:46] ),

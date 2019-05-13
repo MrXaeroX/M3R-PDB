@@ -88,17 +88,20 @@ def Main():
   vm.Info( "Initializing..." )
   genename = None
   pdbname = None
+  chainid = "A"
   nummodels = 0
 
   parser = argparse.ArgumentParser()
   parser.add_argument( "-g", "--gene", help="gene name to lookup" )
   parser.add_argument( "-p", "--pdb", help="source PDB file" )
+  parser.add_argument( "-c", "--chain",
+                       help="PDB file chain of the protein (default is A)" )
   parser.add_argument( "-n", "--nummodels",
                        help="maximum number of models to generate" )
   args = parser.parse_args()
 
   # Possible gene names: OGG1, UNG, etc.
-  genename = args.gene
+  genename = args.gene.upper()
   if not genename:
     vm.Error( "Gene name not set, use --gene as a command-line option" )
     return 1
@@ -114,13 +117,16 @@ def Main():
     vm.Error( "Number of output models not set, use --nummodels as a " \
               "command-line option" )
     return 1
+  if args.chain:
+    chainid = args.chain.upper()
 
   settings = None
   try:
     settings = LoadSettingsFromFile()
   except IOError as e:
     vm.Error( "Couldn't read settings file." )
-    vm.Error( str( e ) )
+    vm.Error( "IOError: {}".format( e ) )
+    return 1
 
   vm.Info( "Logging in to COSMIC database, please wait..." )
   cosmic_login = None
@@ -178,13 +184,19 @@ def Main():
   if not pdbname.endswith( ".pdb" ):
     pdbname += ".pdb"
   vm.Info( "Loading \"%s\"..." % pdbname )
-  pdbfile = PDBFile( pdbname )
+  try:
+    pdbfile = PDBFile( pdbname )
+  except IOError as e:
+    vm.Error( "Couldn't load PDB file." )
+    vm.Error( "IOError: {}".format( e ) )
+    return 1
+  pdb_fasta = pdbfile.GetFASTA( chainid )
 
   # Align our estimated sequence and the sequence loaded from PDB.
   vm.Info( "Aligning sequences, please wait..." )
   vocab = Vocabulary()
   ref_encoded = vocab.encodeSequence( Sequence( fastas[matching_fasta_name] ) )
-  pdb_encoded = vocab.encodeSequence( Sequence( pdbfile.GetFASTA() ) )
+  pdb_encoded = vocab.encodeSequence( Sequence( pdb_fasta ) )
   aligner = StrictGlobalSequenceAligner( SimpleScoring( 2, -1 ), -2 )
   score, encodeds = aligner.align( ref_encoded, pdb_encoded, backtrace=True )
   if len( encodeds ) < 1:
@@ -194,42 +206,51 @@ def Main():
   aligned_fasta = "".join( str( letter ) for letter in \
                            vocab.decodeSequence( encodeds[0].second ).elements )
 
-  # Generate "real" residue numbers.
-  real_resid = []
-  real_position = 0
-  base_offset = pdbfile.GetResidueBaseOffset()
+  # Generate PDB residue numbers mapped to aligned FASTA.
+  pdb_resid_map = []
+  pdb_position = 0
+  pdb_fasta_len = len( pdb_fasta )
   for letter in aligned_fasta:
-    if letter == "-":
-      real_resid.append( 0 )
+    if pdb_position >= pdb_fasta_len:
+      pdb_resid_map.append( 0 )
       continue
-    real_position = real_position + 1
-    real_resid.append( base_offset + real_position )
+    if letter == "-":
+      pdb_resid_map.append( 0 )
+      if pdb_fasta[pdb_position] == "-":
+        pdb_position = pdb_position + 1
+      continue
+    if pdb_fasta[pdb_position] == "-":
+      pdb_resid_map.append( 0 )
+    else:
+      pdb_resid_map.append( pdb_position + 1 )
+    pdb_position = pdb_position + 1
 
   # Build a list of mutations that can be mapped onto our aligned sequence.
   pdb_mutation_info = {}
   mutation_counter = 0
   for mut in mutations["AA Mutation"]:
     mut_source, mut_number, mut_target = parse.parse( "p.{}{:d}{}", mut )
-    if aligned_fasta[mut_number-1] == mut_source:
-      mut_name = mut_source + str( mut_number ) + mut_target
-      mut_dict_index = "{:08d}{}".format( mut_number, mut_target )
-      if mut_dict_index in pdb_mutation_info:
-        # vm.Warn( "Skipping duplicate mutation info for '%s'." % mut_name )
-        continue
-      if not pdbfile.ResidueExists( real_resid[mut_number-1] ):
-        vm.Warn( "Skipping mutation of missing residue '%s'." % mut_name )
-        continue
-      pdb_mutation_info[mut_dict_index] = {
-        "name" : mut_name,
-        "resid" : real_resid[mut_number-1],
-        "from" : mut_source,
-        "to" : mut_target,
-        "status" : mutations["Somatic Status"][mutation_counter],
-        "transcript" : mutations["Transcript"][mutation_counter],
-        "zygosity" : mutations["Zygosity"][mutation_counter],
-        "tissue" : mutations["Primary Tissue"][mutation_counter],
-        "histology" : mutations["Histology"][mutation_counter]
-      }
+    if aligned_fasta[mut_number-1] != mut_source:
+      continue
+    mut_name = mut_source + str( mut_number ) + mut_target
+    mut_dict_index = "{:08d}{}".format( mut_number, mut_target )
+    if mut_dict_index in pdb_mutation_info:
+      # vm.Warn( "Skipping duplicate mutation info for '%s'." % mut_name )
+      continue
+    if not pdb_resid_map[mut_number-1]:
+      vm.Warn( "Skipping mutation of missing residue '%s'." % mut_name )
+      continue
+    pdb_mutation_info[mut_dict_index] = {
+      "name" : mut_name,
+      "resid" : pdb_resid_map[mut_number-1],
+      "from" : mut_source,
+      "to" : mut_target,
+      "status" : mutations["Somatic Status"][mutation_counter],
+      "transcript" : mutations["Transcript"][mutation_counter],
+      "zygosity" : mutations["Zygosity"][mutation_counter],
+      "tissue" : mutations["Primary Tissue"][mutation_counter],
+      "histology" : mutations["Histology"][mutation_counter]
+    }
     mutation_counter = mutation_counter + 1
   pdb_mutation_info = collections.OrderedDict( \
       sorted( pdb_mutation_info.iteritems() ) ).values()
@@ -252,7 +273,7 @@ def Main():
     output_name = filename + "." + mut["name"].lower() + fileext
     vm.Info( "Saving: %s" % output_name )
     pdbfile_mutated = copy.deepcopy( pdbfile )
-    pdbfile_mutated.MutateAA( mut )
+    pdbfile_mutated.MutateAA( chainid, mut )
     pdbfile_mutated.Save( output_name, progname )
 
   vm.Print( "All done." )
